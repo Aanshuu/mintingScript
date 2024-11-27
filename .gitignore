@@ -2,3 +2,4 @@
 .env
 .wallet phrase.txt
 
+node_modules
