@@ -6,16 +6,18 @@ import {
   Address,
   parseUnits,
   Abi,
-  WalletClient,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { defineChain } from "viem";
 import * as dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
 import abi from "./abi";
 import cryptoWords from "./cryptowords";
 
 dotenv.config();
 
+// Define custom chain
 const creatorChainTestnet = defineChain({
   id: 66665,
   name: "Creator Testnet",
@@ -34,11 +36,13 @@ const creatorChainTestnet = defineChain({
   },
 });
 
+// Environment variables
 const privateKey = process.env.PRIVATE_KEY || "";
 const contractAddress: `0x${string}` = (process.env.CONTRACT_ADDRESS ||
   "") as `0x${string}`;
 const account = privateKeyToAccount(`0x${privateKey}`);
 
+// Clients
 const publicClient = createPublicClient({
   chain: creatorChainTestnet,
   transport: http(),
@@ -50,20 +54,34 @@ const walletClient = createWalletClient({
   transport: http(),
 });
 
-// Read contract details
-async function readContract() {
-  try {
-    const data = await publicClient.readContract({
-      address: contractAddress,
-      abi: abi,
-      functionName: "symbol",
-      args: [],
-    });
-    console.log(`Contract symbol: ${data}`);
-    return data;
-  } catch (error) {
-    console.error("Error reading contract:", error);
+// File paths
+const mintedDomainsFile = path.resolve(__dirname, "mintedDomains.json");
+
+// Initialize minted domains data
+let mintedData: { domains: string[]; txHash: string; address: string }[] = [];
+let totalMintedDomains = 0;
+let currentDomainIndex = 0; // Track progress in the cryptoWords list
+
+// Load data from JSON
+function loadMintedData() {
+  if (fs.existsSync(mintedDomainsFile)) {
+    const data = JSON.parse(fs.readFileSync(mintedDomainsFile, "utf8"));
+    mintedData = data.mintedData || [];
+    currentDomainIndex = data.currentDomainIndex || 0;
+    totalMintedDomains = mintedData.reduce(
+      (acc, entry) => acc + entry.domains.length,
+      0
+    );
   }
+}
+
+// Save data to JSON
+function saveMintedData() {
+  const data = {
+    mintedData,
+    currentDomainIndex,
+  };
+  fs.writeFileSync(mintedDomainsFile, JSON.stringify(data, null, 2));
 }
 
 // Check if a domain is minted
@@ -83,17 +101,28 @@ async function isDomainMinted(domain: string): Promise<boolean> {
 }
 
 // Get available domains
-async function getAvailableDomains(count: number = 2): Promise<string[]> {
+async function getAvailableDomains(count: number): Promise<string[]> {
   const availableDomains: string[] = [];
+  while (
+    availableDomains.length < count &&
+    currentDomainIndex < cryptoWords.length
+  ) {
+    const word = cryptoWords[currentDomainIndex].toLowerCase();
+    currentDomainIndex++;
 
-  for (const word of cryptoWords) {
-    if (availableDomains.length >= count) break;
-
+    // Skip already processed domains
+    const alreadyProcessed = mintedData.some((entry) =>
+      entry.domains.includes(word)
+    );
     const isMinted = await isDomainMinted(word);
-    if (!isMinted) {
-      availableDomains.push(word.toLowerCase());
+
+    if (!alreadyProcessed && !isMinted) {
+      availableDomains.push(word);
     }
   }
+
+  // Save progress after checking domains
+  saveMintedData();
   return availableDomains;
 }
 
@@ -142,25 +171,22 @@ async function fundAccount(newAccount: Address, amount: bigint) {
       to: newAccount,
       value: amount,
     });
-    await publicClient.waitForTransactionReceipt({
-      hash: txHash,
-    });
-    console.log(
-      `Funded account ${newAccount} with ${amount} wei. TxHash: ${txHash}`
-    );
+    await publicClient.waitForTransactionReceipt({ hash: txHash });
+    console.log(`Funded account ${newAccount} with ${amount} wei.`);
   } catch (error) {
     console.error("Error funding account:", error);
     throw error;
   }
 }
 
-// Mint domains
-// Mint domains using signTransaction and sendRawTransaction
+// Update the mintingProcess function
+
+// Update mintDomain function's error handling
 async function mintDomain(
   domains: string[],
   address: Address,
   privateKey: Address
-): Promise<void> {
+): Promise<string | null> {
   try {
     const wallet = createWalletClient({
       account: privateKeyToAccount(privateKey),
@@ -171,7 +197,9 @@ async function mintDomain(
     const calldata = await prepareMintCalldata(domains, address);
     const price = await getPriceToMint(domains);
 
-    const hash = await wallet.writeContract({
+    console.log(`Attempting to mint domains with price: ${price} wei`);
+
+    const txHash = await wallet.writeContract({
       address: contractAddress,
       abi: abi as Abi,
       functionName: "registerDomains",
@@ -185,54 +213,84 @@ async function mintDomain(
       value: price,
     });
 
-    const txHash = hash;
-
-    console.log(`Transaction submitted. TxHash: ${txHash}`);
-
-    // Wait for the transaction receipt
-    await publicClient.waitForTransactionReceipt({ hash: txHash });
-
-    console.log(
-      `Domains ${domains.join(", ")} minted successfully! TxHash: ${txHash}`
-    );
-  } catch (error) {
-    console.error("Error minting domains:", error);
+    console.log(`Transaction sent: ${txHash}`);
+    return txHash;
+  } catch (error: any) {
+    console.error("Detailed minting error:", error);
+    return null;
   }
 }
 
-
-// Main execution function
-(async () => {
+async function mintingProcess() {
   console.log("Starting minting process...");
+  loadMintedData();
 
-  // Step 1: Create a new account
-  const newPrivateKey = generatePrivateKey();
-  const newAccount = privateKeyToAccount(newPrivateKey);
-  console.log(`Generated new account: ${newAccount.address}`);
+  try {
+    const newPrivateKey = generatePrivateKey();
+    const newAccount = privateKeyToAccount(newPrivateKey);
+    console.log(`Generated new account: ${newAccount.address}`);
 
-  // Step 2: Check required amount (price + gas)
-  const availableDomains = await getAvailableDomains(2);
-  if (availableDomains.length === 0) {
-    console.log("No available domains to mint.");
-    return;
+    const count = Math.floor(Math.random() * 2) + 1;
+    let domainsToMint = await getAvailableDomains(count);
+
+    if (domainsToMint.length === 0) {
+      console.log("No available domains to mint.Stopping the process.");
+      process.exit(0);
+      return;
+    }
+
+    console.log(`Domains to mint: ${domainsToMint.join(", ")}`);
+
+    // Calculate total cost with higher gas buffer
+    const price = await getPriceToMint(domainsToMint);
+    const gasFee = parseUnits("0.0002", 18);
+    const totalRequired = price + gasFee;
+
+    console.log(`Total required: ${totalRequired} wei`);
+
+    // Fund account
+    await fundAccount(newAccount.address, totalRequired);
+
+    // Verify balance after funding
+    const balance = await publicClient.getBalance({
+      address: newAccount.address,
+    });
+    console.log(`Account balance after funding: ${balance} wei`);
+
+    if (balance < totalRequired) {
+      throw new Error("Insufficient balance after funding");
+    }
+
+    // Wait for 2 seconds after funding
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const txHash = await mintDomain(
+      domainsToMint,
+      newAccount.address,
+      newPrivateKey
+    );
+
+    if (txHash) {
+      // Wait for confirmation
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash: txHash as `0x${string}`,
+        confirmations: 2, // Wait for 2 confirmations
+        timeout: 60_000, // 60 second timeout
+      });
+
+      console.log(`Transaction confirmed! Status: ${receipt.status}`);
+      console.log(`Total domains minted: ${totalMintedDomains}`);
+    }
+  } catch (error) {
+    console.error("Error in minting process:", error);
   }
-  const price = await getPriceToMint(availableDomains);
-  const gasFee = parseUnits("0.02", 18); // Assuming a buffer gas fee
-  const totalRequired = price + gasFee;
+}
 
-  console.log(`Total required for minting: ${totalRequired}`);
-
-  // Step 3: Fund the new account
-  await fundAccount(newAccount.address, totalRequired);
-
-  // Step 4: Mint domains using the new account
-  const newWalletClient = createWalletClient({
-    account: newAccount,
-    chain: creatorChainTestnet,
-    transport: http(),
-  });
-
-  await mintDomain(availableDomains, newAccount.address, newPrivateKey);
-
-  console.log("Minting process completed!");
-})();
+// Update the interval timing
+setInterval(async () => {
+  try {
+    await mintingProcess();
+  } catch (error) {
+    console.error("Error in automated process:", error);
+  }
+}, 60 * 1000); // Increased to 5 seconds
